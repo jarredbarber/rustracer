@@ -1,322 +1,18 @@
 // #[macro_use]
-// extern crate cgmath;
 use cgmath::prelude::*;
-use cgmath::{Deg, Matrix4, Rad, Vector2, Vector3, Vector4};
+use cgmath::{Deg, Point3, Rad};
 use rand::prelude::*;
 use rayon::prelude::*;
 
-type Vec4f = Vector4<f32>;
-type Vec3f = Vector3<f32>;
-type Vec2f = Vector2<f32>;
-type Mat4f = Matrix4<f32>;
+mod geometry;
+mod lights;
+mod materials;
+mod primitives;
 
-fn proj_orth(x: &Vec4f, z: &Vec4f) -> Vec4f {
-    let a = x.dot(*z);
-    let b = z.dot(*z);
-    x - (a / b) * z
-}
-
-pub struct Ray {
-    pub origin: Vec4f,
-    pub direction: Vec4f,
-}
-
-impl Ray {
-    pub fn new(origin: Vec4f, dir: Vec4f) -> Ray {
-        let direction = dir.normalize();
-        assert!(direction.w == 0.0);
-        assert!(origin.w == 1.0);
-        Ray { origin, direction }
-    }
-
-    pub fn to(&self, t: f32) -> Vec4f {
-        self.origin + t * self.direction
-    }
-
-    pub fn from_target(origin: Vec4f, target: &Vec4f) -> Ray {
-        Ray::new(origin, target - origin)
-    }
-
-    pub fn transform(&self, transform: &Mat4f) -> Ray {
-        Ray {
-            origin: transform * self.origin,
-            direction: (transform * self.direction).normalize(),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct Intersection {
-    pub point: Vec4f,
-    pub normal: Vec4f,
-    pub uv: Vec2f,
-    pub t: f32,
-}
-
-trait Intersectable {
-    fn intersect(&self, ray: &Ray) -> Option<Intersection>;
-}
-
-trait BRDF {
-    fn brdf(&self, point: &Vec4f, light: &Vec4f, normal: &Vec4f, uv: &Vec2f, look: &Vec4f)
-        -> Vec3f;
-
-    fn reflection_vector(&self, normal: &Vec4f, look: &Vec4f) -> Vec4f {
-        2.0 * look.dot(*normal) * normal - look
-    }
-
-    fn refractive_index(&self) -> f32 {
-        1.0
-    }
-
-    fn energy_distribution(&self) -> Vec3f {
-        Vec3f::new(1.0, 0.0, 0.0)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Phong {
-    diffuse: Vec3f,
-    specular: Vec3f,
-    spec_exp: f32,
-    transmission: f32,
-    reflection: f32,
-    index: f32,
-}
-
-impl BRDF for Phong {
-    fn brdf(
-        &self,
-        _point: &Vec4f,
-        light: &Vec4f,
-        normal: &Vec4f,
-        _uv: &Vec2f,
-        view: &Vec4f,
-    ) -> Vec3f {
-        let refl = self.reflection_vector(normal, light);
-
-        let ln = normal.dot(*light);
-        let rv = refl.dot(*view);
-
-        self.diffuse * ln.clamp(0.0, 1.0) + self.specular * rv.clamp(0.0, 1.0).powf(self.spec_exp)
-    }
-
-    fn refractive_index(&self) -> f32 {
-        self.index
-    }
-
-    fn energy_distribution(&self) -> Vec3f {
-        let diffuse = 1.0; // - self.transmission - self.reflection;
-        Vec3f::new(diffuse, self.reflection, self.transmission)
-    }
-}
-
-struct Checkerboard(f32, f32);
-impl BRDF for Checkerboard {
-    fn brdf(
-        &self,
-        _point: &Vec4f,
-        _light: &Vec4f,
-        _normal: &Vec4f,
-        uv: &Vec2f,
-        _view: &Vec4f,
-    ) -> Vec3f {
-        let Checkerboard(nx, ny) = self;
-
-        let tx: i32 = ((uv[0] * 0.5 + 0.5) * nx) as i32;
-        let ty: i32 = ((uv[1] * 0.5 + 0.5) * ny) as i32;
-
-        let tile = ((tx + ty) % 2) as f32;
-        tile * Vec3f::new(1.0, 1.0, 1.0)
-    }
-}
-struct Plane;
-
-impl Intersectable for Plane {
-    fn intersect(&self, ray: &Ray) -> Option<Intersection> {
-        // Solve for (ray.origin + t*ray.direction).zhat() = 0
-        // t = -ray.origin.zhat() / ray.direction.zhat()
-
-        let a = ray.direction.z;
-        let b = -ray.origin.z;
-
-        // Ray is orthogonal to plane
-        if a == 0.0 {
-            return None;
-        }
-
-        let t = b / a;
-
-        if t <= 0.0 {
-            return None;
-        }
-
-        // Compute intersect point
-        let point = ray.to(t);
-        // Check x and y
-        if point.x.abs() > 1.0 || point.y.abs() > 1.0 {
-            return None;
-        }
-
-        // Ok now we have an intersection
-        Some(Intersection {
-            point,
-            normal: Vec4f::unit_z(),
-            uv: Vec2f::new(point.x, point.y),
-            t,
-        })
-    }
-}
-
-struct CSGInt<O1: Intersectable, O2: Intersectable>(O1, O2);
-impl<O1: Intersectable, O2: Intersectable> Intersectable for CSGInt<O1, O2> {
-    fn intersect(&self, ray: &Ray) -> Option<Intersection> {
-        let CSGInt(o1, o2) = self;
-        let i1 = o1.intersect(&ray);
-        if i1.is_none() {
-            return None;
-        }
-        let i2 = o2.intersect(&ray);
-        if i2.is_none() {
-            return None;
-        }
-
-        // Both interesct, return closest
-        let t1 = i1.unwrap().t;
-        let t2 = i2.unwrap().t;
-
-        if t1 < t2 {
-            i1
-        } else {
-            i2
-        }
-    }
-}
-
-struct CSGUnion<O1: Intersectable, O2: Intersectable>(O1, O2);
-impl<O1: Intersectable, O2: Intersectable> Intersectable for CSGUnion<O1, O2> {
-    fn intersect(&self, ray: &Ray) -> Option<Intersection> {
-        let CSGUnion(o1, o2) = self;
-        let i1 = o1.intersect(&ray);
-        let i2 = o2.intersect(&ray);
-        if i1.is_none() {
-            return i2;
-        }
-        if i2.is_none() {
-            return i1;
-        }
-
-        // Both interesct, return closest
-        let t1 = i1.unwrap().t;
-        let t2 = i2.unwrap().t;
-
-        if t1 < t2 {
-            i1
-        } else {
-            i2
-        }
-    }
-}
-
-struct FlipNormal<T: Intersectable>(T);
-impl<T: Intersectable> Intersectable for FlipNormal<T> {
-    fn intersect(&self, ray: &Ray) -> Option<Intersection> {
-        let FlipNormal(obj) = self;
-        match obj.intersect(&ray) {
-            None => None,
-            Some(int) => Some(Intersection {
-                point: int.point,
-                normal: -int.normal,
-                uv: int.uv,
-                t: int.t,
-            }),
-        }
-    }
-}
-struct Transformed<T: Intersectable>(Mat4f, Mat4f, T);
-impl<T: Intersectable> Transformed<T> {
-    pub fn new(obj: T, transform: Mat4f) -> Self {
-        Transformed(transform, transform.invert().unwrap(), obj)
-    }
-}
-
-impl<T: Intersectable> Intersectable for Transformed<T> {
-    fn intersect(&self, ray: &Ray) -> Option<Intersection> {
-        let Transformed(tx, itx, obj) = self;
-        let ray_prime = ray.transform(itx);
-
-        match obj.intersect(&ray_prime) {
-            None => None,
-            Some(Intersection {
-                point,
-                normal,
-                uv,
-                t: _,
-            }) => Some(Intersection {
-                point: tx * point,
-                normal: (tx * normal).normalize(),
-                uv,
-                t: (tx * point - ray.origin).magnitude(),
-            }),
-        }
-    }
-}
-
-struct Sphere {}
-impl Intersectable for Sphere {
-    fn intersect(&self, ray: &Ray) -> Option<Intersection> {
-        let x0 = ray.origin - Vec4f::unit_w();
-
-        // solve for ||origin + t*dir - position||^2 = r^2
-        // or
-        // ||x0 + t*dir||^2 = r^2
-        // or
-        // (x0^2 - r^2) + 2*t*(dir . x0) + t^2 dir^2 = c + b*t + a*t^2 = 0
-        let a = ray.direction.dot(ray.direction); // should be 1
-        let b = 2.0 * x0.dot(ray.direction);
-        let c = x0.dot(x0) - 1.0;
-
-        // quadratic discriminant
-        let d = b * b - 4.0 * a * c;
-
-        let t: f32 = if d > 0.0 {
-            let u = -0.5 * b / a;
-            let v = 0.5 * d.sqrt() / a;
-
-            // possible roots
-            let mut t0 = u - v;
-            let mut t1 = u + v;
-
-            // Smallest non-negative root
-            if t1 < t0 {
-                std::mem::swap(&mut t0, &mut t1);
-            }
-
-            if t0 >= 0.0 {
-                t0
-            } else {
-                t1
-            }
-        } else {
-            -1.0
-        };
-
-        if t > 0.0 {
-            let point = ray.to(t);
-
-            let normal = (point - Vec4f::unit_w()).normalize();
-
-            Some(Intersection {
-                point,
-                normal,
-                uv: Vec2f::zero(),
-                t,
-            })
-        } else {
-            None
-        }
-    }
-}
+use crate::geometry::*;
+use crate::lights::*;
+use crate::materials::*;
+use crate::primitives::*;
 
 trait Camera {
     fn sample_ray(&self, x: f32, y: f32) -> Ray;
@@ -394,123 +90,6 @@ impl<O, M: BRDF> BRDF for Object<O, M> {
     }
 }
 
-struct Light {
-    direction: Vec4f,
-    color: Vec4f,
-}
-
-impl Light {
-    fn new(direction: Vec4f, color: Vec4f) -> Self {
-        Self {
-            direction: direction.normalize(),
-            color,
-        }
-    }
-}
-
-fn trace(scene: &Vec<Box<dyn Traceable>>, ray: &Ray, depth: u32) -> Option<Vec4f> {
-    if depth > 10 {
-        return None;
-    }
-
-    let light_color = 0.5 * Vec4f::new(1.0, 1.0, 1.0, 0.0);
-    let lights = vec![
-        Light::new(Vec4f::new(0.0, 5.0, 10.0, 0.0), light_color),
-        Light::new(Vec4f::new(-1.0, 0.0, 0.2, 0.0), light_color),
-    ];
-
-    let mut result = None;
-    for (id, obj) in scene.iter().enumerate() {
-        match obj.intersect(&ray) {
-            None => (),
-            Some(int) => match result {
-                None => result = Some((id, int)),
-                Some((_, int2)) => {
-                    if int.t < int2.t {
-                        result = Some((id, int))
-                    }
-                }
-            },
-        }
-    }
-
-    match result {
-        None => None,
-        Some((obj, int)) => {
-            let mut color = Vec4f::unit_w();
-            let energy = scene[obj].energy_distribution();
-            if energy[1] > 0.0 {
-                // Generate reflected rays
-                let refl_vec =
-                    scene[obj].reflection_vector(&int.normal, &-ray.direction.normalize());
-                let refl_ray = Ray::new(int.point + 1e-3 * refl_vec, refl_vec);
-                match trace(&scene, &refl_ray, depth + 1) {
-                    None => (),
-                    Some(refl_color) => {
-                        color += energy[1] * refl_color;
-                    }
-                }
-            }
-            if energy[2] > 0.0 {
-                // Generate transmitted rays
-                // point from intersection point to incoming ray
-                let mut normal = int.normal.normalize();
-                let light = ray.direction.normalize();
-                let n = scene[obj].refractive_index();
-                let r = if light.dot(normal) > 0.0 { 1.0 / n } else { n };
-                if light.dot(normal) > 0.0 {
-                    normal *= -1.0;
-                }
-
-                assert!(light.w == 0.0);
-                assert!(normal.w == 0.0);
-                let c = light.dot(normal);
-
-                // let d = c * c + r * r - 1.0;
-                let d = 1.0 - r * r * (1.0 - c * c);
-
-                if d >= 0.0 {
-                    // let tr_vec = r * (light + (d.sqrt() + c) * normal);
-                    let tr_vec = r * (light - c * normal) - d.sqrt() * normal;
-
-                    assert!(tr_vec.w == 0.0);
-
-                    let tr_ray = Ray::new(int.point + 1e-3 * tr_vec, tr_vec);
-
-                    match trace(&scene, &tr_ray, depth + 1) {
-                        None => (),
-                        Some(tr_color) => {
-                            color += energy[2] * tr_color;
-                        }
-                    }
-                }
-            }
-            if energy[0] > 0.0 && int.normal.dot(ray.direction) < 0.0 {
-                // Factor in lighting
-                for light in lights.iter() {
-                    if light.direction.dot(int.normal) > 0.0 {
-                        match trace(
-                            &scene,
-                            &Ray::new(int.point + 1e-3 * int.normal, light.direction),
-                            depth + 1,
-                        ) {
-                            None => {
-                                let look = -ray.direction;
-                                let _color = scene[obj]
-                                    .brdf(&int.point, &light.direction, &int.normal, &int.uv, &look)
-                                    .extend(1.0);
-                                color += energy[0] * light.color.mul_element_wise(_color);
-                            }
-                            _ => (),
-                        }
-                    }
-                }
-            }
-            Some(color)
-        }
-    }
-}
-
 struct ImageBuffer {
     res_x: usize,
     res_y: usize,
@@ -569,12 +148,113 @@ impl ImageBuffer {
     }
 }
 
-fn render<C: Camera>(
-    scene: &Vec<Box<dyn Traceable>>,
-    camera: &C,
-    output: &mut ImageBuffer,
-    n_samples: usize,
-) {
+pub struct Scene {
+    objects: Vec<Box<dyn Traceable>>,
+    lights: Vec<Box<dyn Light>>,
+}
+fn trace(scene: &Scene, ray: &Ray, depth: u32) -> Option<Vec4f> {
+    if depth > 10 {
+        return None;
+    }
+
+    let mut result = None;
+    for (id, obj) in scene.objects.iter().enumerate() {
+        match obj.intersect(&ray) {
+            None => (),
+            Some(int) => match result {
+                None => result = Some((id, int)),
+                Some((_, int2)) => {
+                    if int.t < int2.t {
+                        result = Some((id, int))
+                    }
+                }
+            },
+        }
+    }
+
+    match result {
+        None => None,
+        Some((obj, int)) => {
+            let mut color = Vec4f::unit_w();
+            let energy = scene.objects[obj].energy_distribution();
+            if energy[1] > 0.0 {
+                // Generate reflected rays
+                let refl_vec =
+                    scene.objects[obj].reflection_vector(&int.normal, &-ray.direction.normalize());
+                let refl_ray = Ray::new(int.point + 1e-3 * refl_vec, refl_vec);
+                match trace(&scene, &refl_ray, depth + 1) {
+                    None => (),
+                    Some(refl_color) => {
+                        color += energy[1] * refl_color;
+                    }
+                }
+            }
+            if energy[2] > 0.0 {
+                // Generate transmitted rays
+                // point from intersection point to incoming ray
+                let mut normal = int.normal.normalize();
+                let light = ray.direction.normalize();
+                let n = scene.objects[obj].refractive_index();
+                let r = if light.dot(normal) > 0.0 { 1.0 / n } else { n };
+                if light.dot(normal) > 0.0 {
+                    normal *= -1.0;
+                }
+
+                assert!(light.w == 0.0);
+                assert!(normal.w == 0.0);
+                let c = light.dot(normal);
+
+                // let d = c * c + r * r - 1.0;
+                let d = 1.0 - r * r * (1.0 - c * c);
+
+                if d >= 0.0 {
+                    // let tr_vec = r * (light + (d.sqrt() + c) * normal);
+                    let tr_vec = r * (light - c * normal) - d.sqrt() * normal;
+
+                    assert!(tr_vec.w == 0.0);
+
+                    let tr_ray = Ray::new(int.point + 1e-3 * tr_vec, tr_vec);
+
+                    match trace(&scene, &tr_ray, depth + 1) {
+                        None => (),
+                        Some(tr_color) => {
+                            color += energy[2] * tr_color;
+                        }
+                    }
+                }
+            }
+            if energy[0] > 0.0 && int.normal.dot(ray.direction) < 0.0 {
+                // Factor in lighting
+                for light in scene.lights.iter() {
+                    let (light_ray, light_color) = light.sample(&int.point, &int.normal);
+
+                    if light_ray.direction.dot(int.normal) > 0.0 {
+                        match trace(&scene, &light_ray.bump(), depth + 1) {
+                            None => {
+                                let look = -ray.direction;
+                                let _color = scene.objects[obj]
+                                    .brdf(
+                                        &int.point,
+                                        &light_ray.direction,
+                                        &int.normal,
+                                        &int.uv,
+                                        &look,
+                                    )
+                                    .extend(1.0);
+                                color +=
+                                    energy[0] * light_color.extend(1.0).mul_element_wise(_color);
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+            }
+            Some(color)
+        }
+    }
+}
+
+fn render<C: Camera>(scene: &Scene, camera: &C, output: &mut ImageBuffer, n_samples: usize) {
     let mut rng = rand::thread_rng();
 
     let mut rays = Vec::new();
@@ -625,7 +305,23 @@ fn main() {
         aspect,
     );
 
-    let mut scene: Vec<Box<dyn Traceable>> = vec![
+    let light_color = 0.5 * Vec3f::new(1.0, 1.0, 1.0);
+    let lights: Vec<Box<dyn Light>> = vec![
+        // Box::new(SunLight::new(Vec4f::new(0.0, 5.0, 10.0, 0.0), light_color)),
+        // Box::new(SunLight::new(Vec4f::new(-1.0, 0.0, 0.2, 0.0), light_color)),
+        Box::new(AreaLight {
+            transform: Mat4f::from_translation(Vec3f::new(0.0, -5.0, 0.0))
+                * Mat4f::from_angle_x::<Deg<f32>>(Deg(-90.0)),
+            color: 10.0 * light_color,
+        }),
+        Box::new(AreaLight {
+            transform: Mat4f::from_translation(Vec3f::new(0.0, 3.0, 2.5))
+                * Mat4f::from_angle_y::<Deg<f32>>(Deg(180.0f32)),
+            color: 2.0 * light_color,
+        }),
+    ];
+
+    let mut objects: Vec<Box<dyn Traceable>> = vec![
         Object::boxed(
             Transformed::new(
                 Sphere {},
@@ -648,15 +344,16 @@ fn main() {
             Checkerboard(8.0, 8.0),
         ),
     ];
+
     for kx in [-1.5, 1.5] {
         for ky in [-1.5, 1.5] {
-            scene.push(Object::boxed(
+            objects.push(Object::boxed(
                 Transformed::new(
                     CSGUnion(
                         Sphere {},
                         FlipNormal(Transformed::new(Sphere {}, Mat4f::from_scale(0.95))),
                     ),
-                    Matrix4::from_translation(Vec3f::new(kx, ky, -0.25)) * Matrix4::from_scale(0.5),
+                    Mat4f::from_translation(Vec3f::new(kx, ky, -0.25)) * Mat4f::from_scale(0.5),
                 ),
                 Phong {
                     diffuse: 0.8 * Vec3f::new(0.5, (kx + 1.5) / 3.0, (ky + 1.5) / 3.0),
@@ -670,7 +367,9 @@ fn main() {
         }
     }
 
-    let n_samples: usize = 32;
+    let scene = Scene { objects, lights };
+
+    let n_samples: usize = 256;
 
     let mut output = ImageBuffer::new(res_x, res_y);
 

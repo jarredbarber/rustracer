@@ -11,6 +11,8 @@ Basic raytracing in Rust.
 * Phong (diffuse/specular) reflectivity
 * Basic shapes: spheres/planes
 * Reflection / Refraction (with refractive index)
+* Area lights / soft shadows
 * Parallelism (using rayon)
 * Anti-aliasing (via multiple rays per pixel)
+
 
